@@ -1,0 +1,9 @@
+{
+  "participants": ["Vinicius Felpe"],
+  "social": [
+    "https://github.com/atomosdovini"
+  ],
+  "source-code-repo": "https://github.com/atomosdovini/rinha-fraud-cpp",
+  "stack": ["c++", "ivf", "avx2", "io_uring", "multi-thread"],
+  "open_to_work": false
+}
