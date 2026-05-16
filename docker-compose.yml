@@ -1,30 +1,45 @@
 services:
-  # Sem load balancer: api1 e api2 fazem bind direto em :9999 com SO_REUSEPORT.
-  # O kernel distribui as conexões entre os dois sockets — zero hop em userspace,
-  # zero fd-passing. api2 compartilha o network namespace de api1.
-  #
-  # Branch `submission`: imagem PRÉ-BUILDADA (sem `build:`), pública, linux/amd64.
-  api1:
+  # Load balancer obrigatório (ARQUITETURA.md): recebe na :9999 e distribui
+  # as conexões round-robin para api1/api2 passando o fd via SCM_RIGHTS sobre
+  # Unix sockets — sem inspecionar payload, sem lógica de negócio.
+  lb:
     image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
+    entrypoint: ["/lb"]
     ports:
       - "9999:9999"
     environment:
-      - TCP_PORT=9999
+      - PORT=9999
+      - WORKERS=2
+      - UPSTREAMS=/sockets/api1.sock,/sockets/api2.sock
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "20M"
+
+  api1:
+    image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
+    environment:
+      - LISTEN=/sockets/api1.sock
       - INDEX_PATH=/index/index.bin
-      - NPROBE=20
-      - FAST_NPROBE=1
-      - ADAPTIVE_MIN=2
-      - ADAPTIVE_MAX=4
-      - EXTREME0_WORST_THRESHOLD=3501932
-      - EXTREME1_WORST_THRESHOLD=3569273
-      - EXTREME5_WORST_THRESHOLD=4594089
-      - REPAIR_MIN=99
-      - REPAIR_MAX=0
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - BUSY_POLL=0
       - PM_QOS=10
       - WORKERS=1
+    volumes:
+      - sockets:/sockets
     security_opt:
       - seccomp:unconfined
     devices:
@@ -37,31 +52,21 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
-          memory: "175M"
+          cpus: "0.45"
+          memory: "165M"
 
   api2:
     image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
-    network_mode: "service:api1"
     environment:
-      - TCP_PORT=9999
+      - LISTEN=/sockets/api2.sock
       - INDEX_PATH=/index/index.bin
-      - NPROBE=20
-      - FAST_NPROBE=1
-      - ADAPTIVE_MIN=2
-      - ADAPTIVE_MAX=4
-      - EXTREME0_WORST_THRESHOLD=3501932
-      - EXTREME1_WORST_THRESHOLD=3569273
-      - EXTREME5_WORST_THRESHOLD=4594089
-      - REPAIR_MIN=99
-      - REPAIR_MAX=0
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - BUSY_POLL=0
       - PM_QOS=10
       - WORKERS=1
-    depends_on:
-      - api1
+    volumes:
+      - sockets:/sockets
     security_opt:
       - seccomp:unconfined
     devices:
@@ -76,5 +81,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
-          memory: "175M"
+          cpus: "0.45"
+          memory: "165M"
+
+volumes:
+  sockets:
