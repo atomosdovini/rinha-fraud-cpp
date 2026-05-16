@@ -17,6 +17,8 @@
 #include <string_view>
 #include <pthread.h>
 #include <poll.h>
+#include <sched.h>
+#include <sys/resource.h>
 
 // ── Sizing ────────────────────────────────────────────────────────────────────
 static constexpr uint32_t RingDepth     = 4096;
@@ -295,6 +297,21 @@ static void drain_ctrl(io_uring* ring, Worker& w, int ctrl_fd) {
 
 // ── Event loop ─────────────────────────────────────────────────────────────────
 static void run(Worker& w) {
+    // Scheduling priority. On the Rinha host (k6 + api1 + api2 sharing 2
+    // cores) a freshly-woken worker otherwise waits for a CPU slice — that
+    // wait is the ~1ms p99 tail. Raising priority lets the worker preempt the
+    // load generator and serve immediately. Env-tunable so it can be swept on
+    // the cloud without a rebuild; both calls need CAP_SYS_NICE.
+    if (const char* v = ::getenv("WORKER_RT"); v && ::atoi(v) > 0) {
+        sched_param sp{};
+        sp.sched_priority = ::atoi(v);
+        if (::sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+            ::perror("sched_setscheduler");
+    } else if (const char* n = ::getenv("WORKER_NICE"); n && ::atoi(n) != 0) {
+        if (::setpriority(PRIO_PROCESS, 0, ::atoi(n)) != 0)
+            ::perror("setpriority");
+    }
+
     // Prefer DEFER_TASKRUN: completion handlers run on our thread inside
     // io_uring_enter() instead of from interrupt context. Cuts wake-up jitter,
     // requires SINGLE_ISSUER. COOP_TASKRUN reduces preemption overhead.
