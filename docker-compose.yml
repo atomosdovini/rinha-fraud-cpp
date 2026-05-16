@@ -22,7 +22,7 @@ services:
       - REPAIR_MAX=0
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
-      - BUSY_POLL=128
+      - BUSY_POLL=0
       - PM_QOS=10
       - WORKERS=1
     security_opt:
@@ -57,7 +57,7 @@ services:
       - REPAIR_MAX=0
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
-      - BUSY_POLL=128
+      - BUSY_POLL=0
       - PM_QOS=10
       - WORKERS=1
     depends_on:
