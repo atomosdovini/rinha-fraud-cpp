@@ -24,9 +24,13 @@ services:
       - MALLOC_ARENA_MAX=1
       - BUSY_POLL=0
       - PM_QOS=10
+      - WORKER_NICE=-20
       - WORKERS=1
     security_opt:
       - seccomp:unconfined
+    cap_add:
+      # WORKER_NICE: o worker chama setpriority() com nice negativo.
+      - SYS_NICE
     devices:
       # PM QoS: server escreve PM_QOS µs aqui p/ limitar C-states (C1/C1E, sem C6).
       - /dev/cpu_dma_latency
@@ -59,11 +63,15 @@ services:
       - MALLOC_ARENA_MAX=1
       - BUSY_POLL=0
       - PM_QOS=10
+      - WORKER_NICE=-20
       - WORKERS=1
     depends_on:
       - api1
     security_opt:
       - seccomp:unconfined
+    cap_add:
+      # WORKER_NICE: o worker chama setpriority() com nice negativo.
+      - SYS_NICE
     devices:
       # PM QoS: server escreve PM_QOS µs aqui p/ limitar C-states (C1/C1E, sem C6).
       - /dev/cpu_dma_latency
