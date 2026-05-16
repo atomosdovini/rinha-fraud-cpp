@@ -2,11 +2,10 @@ services:
   # Sem load balancer: api1 e api2 fazem bind direto em :9999 com SO_REUSEPORT.
   # O kernel distribui as conexões entre os dois sockets — zero hop em userspace,
   # zero fd-passing. api2 compartilha o network namespace de api1.
+  #
+  # Branch `submission`: imagem PRÉ-BUILDADA (sem `build:`), pública, linux/amd64.
   api1:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rinha_fraud_cpp:dev
+    image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
     ports:
       - "9999:9999"
     environment:
@@ -42,7 +41,7 @@ services:
           memory: "175M"
 
   api2:
-    image: rinha_fraud_cpp:dev
+    image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
     network_mode: "service:api1"
     environment:
       - TCP_PORT=9999
