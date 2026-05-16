@@ -432,8 +432,11 @@ private:
                 if (trace) ++trace->initial_pruned;
                 continue;
             }
-            if (i + 1 < used && counts_[bc[i+1]] > 0)
-                __builtin_prefetch(vecs_ + size_t(offsets_[bc[i+1]]) * Dims * Block, 0, 1);
+            if (i + 1 < used && counts_[bc[i+1]] > 0) {
+                uint32_t nxt = offsets_[bc[i+1]];
+                __builtin_prefetch(vecs_   + size_t(nxt) * Dims * Block, 0, 1);
+                __builtin_prefetch(labels_ + size_t(nxt) * Block,         0, 1);
+            }
             probe_cluster(c, q, heap);
             if (trace) ++trace->initial_scanned;
         }

@@ -84,6 +84,7 @@ struct Worker {
         int      fast_nprobe = 1;
         int      adapt_min   = 2;
         int      adapt_max   = 4;
+        int      busy_poll   = 0;   // spin iterations before blocking wait
         uint64_t thr0 = 0, thr1 = 0, thr5 = 0, thr_any = 0;
     } cfg;
 
@@ -336,9 +337,24 @@ static void run(Worker& w) {
         sq_multishot_accept(ring, w.srv_ctrl, Op::AcceptCtrl);
     io_uring_submit(ring);
 
+    // Busy-poll: after draining completions, spin briefly probing the CQ
+    // before falling back to a blocking wait. Keeps the core at high
+    // frequency (avoids the powersave downclock) and removes scheduler
+    // wake-up latency from the tail. Bounded so an idle worker still sleeps
+    // and stays inside the CPU budget.
+    const int spin = w.cfg.busy_poll;
+
     io_uring_cqe* cqe;
     while (true) {
-        if (io_uring_wait_cqe(ring, &cqe) < 0) continue;
+        if (io_uring_peek_cqe(ring, &cqe) != 0) {
+            int got = -1;
+            for (int s = 0; s < spin; ++s) {
+                io_uring_submit_and_get_events(ring);   // run deferred task work
+                if (io_uring_peek_cqe(ring, &cqe) == 0) { got = 0; break; }
+                for (int p = 0; p < 64; ++p) __builtin_ia32_pause();
+            }
+            if (got != 0 && io_uring_wait_cqe(ring, &cqe) < 0) continue;
+        }
 
         uint32_t head, count = 0;
         io_uring_for_each_cqe(ring, head, cqe) {
@@ -467,6 +483,9 @@ static int tcp_listen(int port) {
     int one = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    // Defer accept(): kernel mantém a conexão em SYN_RCVD até chegar o primeiro
+    // dado — elimina uma ida ao io_uring antes do request estar pronto.
+    ::setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &one, sizeof(one));
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -512,6 +531,25 @@ int main() {
 
     ::signal(SIGPIPE, SIG_IGN);
 
+    // PM QoS: cap the CPU idle wake-up latency via /dev/cpu_dma_latency.
+    // `PM_QOS` is the target in µs — the kernel then forbids any C-state
+    // whose exit latency exceeds it. Picking ~10 µs keeps the shallow,
+    // low-power C1/C1E states (fast wake, cool) but forbids C6 (~85 µs),
+    // which is the dominant term in the p99 tail when a worker is woken.
+    // NOTE: do NOT use 0 — that forbids every C-state, pinning idle cores
+    // in C0 (polling) at full power → the laptop overheats and the CPU
+    // thermal-throttles, making everything *slower*. 0/unset = disabled.
+    // The fd must stay open for the constraint to hold; leaked on purpose.
+    int pm_qos = gi("PM_QOS", 0);
+    if (pm_qos > 0) {
+        int pm_fd = ::open("/dev/cpu_dma_latency", O_WRONLY | O_CLOEXEC);
+        if (pm_fd >= 0) {
+            int32_t target = pm_qos;
+            if (::write(pm_fd, &target, sizeof(target)) != sizeof(target))
+                ::close(pm_fd);
+        }
+    }
+
     int tcp_port = gi("TCP_PORT", 0);
     int srv, srv_ctrl = -1;
     if (tcp_port > 0) {
@@ -537,6 +575,7 @@ int main() {
         w.cfg.fast_nprobe = gi("FAST_NPROBE",              1);
         w.cfg.adapt_min   = gi("ADAPTIVE_MIN",             2);
         w.cfg.adapt_max   = gi("ADAPTIVE_MAX",             4);
+        w.cfg.busy_poll   = gi("BUSY_POLL",                0);
         w.cfg.thr0        = gu("EXTREME0_WORST_THRESHOLD", 3501932);
         w.cfg.thr1        = gu("EXTREME1_WORST_THRESHOLD", 3569273);
         w.cfg.thr5        = gu("EXTREME5_WORST_THRESHOLD", 4594089);

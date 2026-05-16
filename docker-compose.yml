@@ -1,39 +1,16 @@
 services:
-  lb:
-    image: rinha_fraud_cpp:dev
-    entrypoint: ["/lb"]
-    ports:
-      - "9999:9999"
-    environment:
-      - UPSTREAMS=/sockets/api1.sock,/sockets/api2.sock
-      - PORT=9999
-      - WORKERS=1
-    volumes:
-      - sockets:/sockets
-    depends_on:
-      - api1
-      - api2
-    security_opt:
-      - seccomp:unconfined
-    logging:
-      driver: "none"
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
-    deploy:
-      resources:
-        limits:
-          cpus: "0.16"
-          memory: "30M"
-
+  # Sem load balancer: api1 e api2 fazem bind direto em :9999 com SO_REUSEPORT.
+  # O kernel distribui as conexões entre os dois sockets — zero hop em userspace,
+  # zero fd-passing. api2 compartilha o network namespace de api1.
   api1:
     build:
       context: .
       dockerfile: Dockerfile
     image: rinha_fraud_cpp:dev
+    ports:
+      - "9999:9999"
     environment:
-      - LISTEN=/sockets/api1.sock
+      - TCP_PORT=9999
       - INDEX_PATH=/index/index.bin
       - NPROBE=20
       - FAST_NPROBE=1
@@ -46,11 +23,14 @@ services:
       - REPAIR_MAX=0
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
+      - BUSY_POLL=128
+      - PM_QOS=10
       - WORKERS=1
-    volumes:
-      - sockets:/sockets
     security_opt:
       - seccomp:unconfined
+    devices:
+      # PM QoS: server escreve PM_QOS µs aqui p/ limitar C-states (C1/C1E, sem C6).
+      - /dev/cpu_dma_latency
     ulimits:
       nofile:
         soft: 65535
@@ -58,13 +38,14 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
-          memory: "160M"
+          cpus: "0.5"
+          memory: "175M"
 
   api2:
     image: rinha_fraud_cpp:dev
+    network_mode: "service:api1"
     environment:
-      - LISTEN=/sockets/api2.sock
+      - TCP_PORT=9999
       - INDEX_PATH=/index/index.bin
       - NPROBE=20
       - FAST_NPROBE=1
@@ -77,13 +58,16 @@ services:
       - REPAIR_MAX=0
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
+      - BUSY_POLL=128
+      - PM_QOS=10
       - WORKERS=1
-    volumes:
-      - sockets:/sockets
     depends_on:
       - api1
     security_opt:
       - seccomp:unconfined
+    devices:
+      # PM QoS: server escreve PM_QOS µs aqui p/ limitar C-states (C1/C1E, sem C6).
+      - /dev/cpu_dma_latency
     logging:
       driver: "none"
     ulimits:
@@ -93,8 +77,5 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
-          memory: "160M"
-
-volumes:
-  sockets:
+          cpus: "0.5"
+          memory: "175M"
