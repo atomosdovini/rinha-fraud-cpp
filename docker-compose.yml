@@ -35,7 +35,7 @@ services:
       - INDEX_PATH=/index/index.bin
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
-      - BUSY_POLL=0
+      - BUSY_POLL=2048
       - PM_QOS=10
       - WORKERS=1
     volumes:
@@ -62,7 +62,7 @@ services:
       - INDEX_PATH=/index/index.bin
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
-      - BUSY_POLL=0
+      - BUSY_POLL=2048
       - PM_QOS=10
       - WORKERS=1
     volumes:
