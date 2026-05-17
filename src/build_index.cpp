@@ -1,18 +1,33 @@
+// build_index.cpp — Offline builder for the exact BVH index.
+//
+// Pipeline: gunzip references.json.gz → parse into int16[14] vectors + labels
+// → bucket by partition_key (up to 256 partitions) → build a median-split
+// KD-tree per bucket with min/max bounding boxes → write index.bin.
+//
+// Usage: build-index references.json.gz index.bin [leaf_size=128]
+
 #include "index.hpp"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
-#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
-#include <limits>
-#include <numeric>
-#include <omp.h>
-#include <random>
+#include <stdexcept>
+#include <vector>
 #include <zlib.h>
 
 using Clock = std::chrono::steady_clock;
+using rinha::Block;
+using rinha::Dims;
+using rinha::Node;
+using rinha::Partition;
+
+// ── Reference parsing ─────────────────────────────────────────────────────────
 
 static std::vector<char> read_gzip(const std::string& path) {
     gzFile f = gzopen(path.c_str(), "rb");
@@ -42,9 +57,11 @@ static const char* find_or_die(const char* p, const char* needle) {
     return q;
 }
 
-static void parse_refs(const std::string& path, std::vector<int16_t>& vectors, std::vector<uint8_t>& labels) {
+static void parse_refs(const std::string& path,
+                       std::vector<int16_t>& vectors,
+                       std::vector<uint8_t>& labels) {
     auto raw = read_gzip(path);
-    vectors.reserve(size_t(3'000'000) * rinha::Dims);
+    vectors.reserve(size_t(3'000'000) * Dims);
     labels.reserve(3'000'000);
 
     const char* p = raw.data();
@@ -52,7 +69,7 @@ static void parse_refs(const std::string& path, std::vector<int16_t>& vectors, s
         p = std::strchr(p, '[');
         if (!p) throw std::runtime_error("bad vector");
         ++p;
-        for (int d = 0; d < rinha::Dims; ++d) {
+        for (int d = 0; d < Dims; ++d) {
             char* end = nullptr;
             float v = std::strtof(p, &end);
             if (end == p) throw std::runtime_error("bad float");
@@ -60,7 +77,7 @@ static void parse_refs(const std::string& path, std::vector<int16_t>& vectors, s
             p = end;
             while (*p == ',' || *p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') ++p;
         }
-        const char* l = find_or_die(p, "\"label\"");
+        const char* l     = find_or_die(p, "\"label\"");
         const char* colon = std::strchr(l, ':');
         const char* quote = std::strchr(colon, '"');
         if (!quote) throw std::runtime_error("bad label");
@@ -68,315 +85,201 @@ static void parse_refs(const std::string& path, std::vector<int16_t>& vectors, s
         p = quote + 1;
     }
 
-    if (labels.empty() || vectors.size() != labels.size() * rinha::Dims) {
+    if (labels.empty() || vectors.size() != labels.size() * Dims)
         throw std::runtime_error("reference parse produced inconsistent data");
-    }
 }
 
-static inline float dist_point_centroid(const int16_t* p, const std::array<float, rinha::Dims>& c) {
-    float s = 0;
-    for (int d = 0; d < rinha::Dims; ++d) {
-        float diff = float(p[d]) - c[d];
-        s += diff * diff;
-    }
-    return s;
-}
+// ── KD-tree construction ──────────────────────────────────────────────────────
 
-static std::array<float, rinha::Dims> point_as_centroid(const std::vector<int16_t>& vectors, uint32_t id) {
-    std::array<float, rinha::Dims> c{};
-    const int16_t* p = vectors.data() + size_t(id) * rinha::Dims;
-    for (int d = 0; d < rinha::Dims; ++d) c[d] = float(p[d]);
-    return c;
-}
+namespace {
 
-static std::vector<uint32_t> make_sample(uint32_t n, uint32_t sample_size, uint64_t seed) {
-    sample_size = std::min(sample_size, n);
-    std::vector<uint32_t> sample(sample_size);
-    std::mt19937_64 rng(seed);
-    std::uniform_int_distribution<uint32_t> pick(0, n - 1);
-    for (uint32_t& v : sample) v = pick(rng);
-    return sample;
-}
+const int16_t*       g_vectors  = nullptr;   // flat n*Dims
+std::vector<Node>    g_nodes;
+std::vector<uint32_t> g_leaf_order;          // reference ids in leaf-scan order
+uint32_t             g_block_count = 0;
+int                  g_leaf_size   = 128;
 
-static std::vector<std::array<float, rinha::Dims>> init_kmeans_pp(
-    const std::vector<int16_t>& vectors,
-    const std::vector<uint32_t>& sample,
-    uint32_t k,
-    uint64_t seed
-) {
-    std::vector<std::array<float, rinha::Dims>> centroids(k);
-    std::vector<float> dmin(sample.size(), std::numeric_limits<float>::infinity());
-    std::mt19937_64 rng(seed);
-    std::uniform_int_distribution<size_t> first_pick(0, sample.size() - 1);
-    centroids[0] = point_as_centroid(vectors, sample[first_pick(rng)]);
+inline const int16_t* vec(uint32_t id) { return g_vectors + size_t(id) * Dims; }
 
-    for (uint32_t c = 1; c < k; ++c) {
-        const auto& prev = centroids[c - 1];
-        double sum = 0;
-        #pragma omp parallel for reduction(+:sum) schedule(static)
-        for (size_t i = 0; i < sample.size(); ++i) {
-            const int16_t* p = vectors.data() + size_t(sample[i]) * rinha::Dims;
-            float d = dist_point_centroid(p, prev);
-            if (d < dmin[i]) dmin[i] = d;
-            sum += dmin[i];
-        }
-        if (sum <= 0) {
-            centroids[c] = point_as_centroid(vectors, sample[first_pick(rng)]);
-            continue;
-        }
-        std::uniform_real_distribution<double> dist(0, sum);
-        double target = dist(rng);
-        double acc = 0;
-        size_t chosen = sample.size() - 1;
-        for (size_t i = 0; i < sample.size(); ++i) {
-            acc += dmin[i];
-            if (acc >= target) {
-                chosen = i;
-                break;
-            }
-        }
-        centroids[c] = point_as_centroid(vectors, sample[chosen]);
-        if ((c & 255U) == 0) std::cerr << "  init centroid " << c << "/" << k << "\n";
-    }
-    return centroids;
-}
-
-static uint16_t nearest_centroid(const int16_t* p, const std::vector<std::array<float, rinha::Dims>>& centroids) {
-    uint16_t best = 0;
-    float best_d = dist_point_centroid(p, centroids[0]);
-    for (uint32_t c = 1; c < centroids.size(); ++c) {
-        float d = dist_point_centroid(p, centroids[c]);
-        if (d < best_d) {
-            best_d = d;
-            best = static_cast<uint16_t>(c);
+// Compute the bounding box of ids[lo,hi) into a node.
+void bbox(const uint32_t* ids, int lo, int hi, Node& n) {
+    int16_t mn[Dims], mx[Dims];
+    const int16_t* v0 = vec(ids[lo]);
+    for (int d = 0; d < Dims; ++d) { mn[d] = v0[d]; mx[d] = v0[d]; }
+    for (int i = lo + 1; i < hi; ++i) {
+        const int16_t* v = vec(ids[i]);
+        for (int d = 0; d < Dims; ++d) {
+            if (v[d] < mn[d]) mn[d] = v[d];
+            if (v[d] > mx[d]) mx[d] = v[d];
         }
     }
-    return best;
+    std::memcpy(n.min, mn, sizeof(mn));
+    std::memcpy(n.max, mx, sizeof(mx));
 }
 
-static void train_sample_kmeans(
-    const std::vector<int16_t>& vectors,
-    const std::vector<uint32_t>& sample,
-    std::vector<std::array<float, rinha::Dims>>& centroids,
-    int iters
-) {
-    const uint32_t k = static_cast<uint32_t>(centroids.size());
-    const int threads = std::max(1, omp_get_max_threads());
-    std::vector<uint16_t> assign(sample.size());
-
-    for (int iter = 0; iter < iters; ++iter) {
-        uint64_t changed = 0;
-        #pragma omp parallel for reduction(+:changed) schedule(static)
-        for (size_t i = 0; i < sample.size(); ++i) {
-            const int16_t* p = vectors.data() + size_t(sample[i]) * rinha::Dims;
-            uint16_t c = nearest_centroid(p, centroids);
-            changed += (c != assign[i]);
-            assign[i] = c;
-        }
-
-        std::vector<double> sums(size_t(threads) * k * rinha::Dims);
-        std::vector<uint32_t> counts(size_t(threads) * k);
-
-        #pragma omp parallel
-        {
-            int tid = omp_get_thread_num();
-            double* tsums = sums.data() + size_t(tid) * k * rinha::Dims;
-            uint32_t* tcounts = counts.data() + size_t(tid) * k;
-            #pragma omp for schedule(static)
-            for (size_t i = 0; i < sample.size(); ++i) {
-                uint16_t c = assign[i];
-                const int16_t* p = vectors.data() + size_t(sample[i]) * rinha::Dims;
-                ++tcounts[c];
-                double* row = tsums + size_t(c) * rinha::Dims;
-                for (int d = 0; d < rinha::Dims; ++d) row[d] += p[d];
-            }
-        }
-
-        std::mt19937_64 rng(0xC0FFEE + iter);
-        std::uniform_int_distribution<size_t> pick(0, sample.size() - 1);
-        for (uint32_t c = 0; c < k; ++c) {
-            uint64_t count = 0;
-            std::array<double, rinha::Dims> sum{};
-            for (int t = 0; t < threads; ++t) {
-                count += counts[size_t(t) * k + c];
-                const double* row = sums.data() + (size_t(t) * k + c) * rinha::Dims;
-                for (int d = 0; d < rinha::Dims; ++d) sum[d] += row[d];
-            }
-            if (count == 0) {
-                centroids[c] = point_as_centroid(vectors, sample[pick(rng)]);
-            } else {
-                double inv = 1.0 / double(count);
-                for (int d = 0; d < rinha::Dims; ++d) centroids[c][d] = float(sum[d] * inv);
-            }
-        }
-        std::cerr << "  sample kmeans iter " << (iter + 1) << "/" << iters
-                  << " changed=" << changed << "\n";
-    }
-}
-
-static std::vector<uint16_t> assign_all(
-    const std::vector<int16_t>& vectors,
-    const std::vector<std::array<float, rinha::Dims>>& centroids,
-    std::vector<uint32_t>& counts
-) {
-    uint32_t n = static_cast<uint32_t>(vectors.size() / rinha::Dims);
-    uint32_t k = static_cast<uint32_t>(centroids.size());
-    std::vector<uint16_t> assign(n);
-    int threads = std::max(1, omp_get_max_threads());
-    std::vector<uint32_t> local_counts(size_t(threads) * k);
-
-    #pragma omp parallel
+// Build a subtree over ids[lo,hi); returns its node index. The id array is
+// reordered in place so each leaf owns a contiguous run.
+int build(std::vector<uint32_t>& ids, int lo, int hi) {
+    int self = int(g_nodes.size());
+    g_nodes.emplace_back();
     {
-        int tid = omp_get_thread_num();
-        uint32_t* lc = local_counts.data() + size_t(tid) * k;
-        #pragma omp for schedule(static)
-        for (uint32_t i = 0; i < n; ++i) {
-            const int16_t* p = vectors.data() + size_t(i) * rinha::Dims;
-            uint16_t c = nearest_centroid(p, centroids);
-            assign[i] = c;
-            ++lc[c];
-        }
+        Node& n = g_nodes[self];
+        bbox(ids.data(), lo, hi, n);
+        n.left = n.right = -1;
+        n.start = 0;
+        n.len   = hi - lo;
     }
 
-    counts.assign(k, 0);
-    for (int t = 0; t < threads; ++t) {
-        for (uint32_t c = 0; c < k; ++c) counts[c] += local_counts[size_t(t) * k + c];
+    const int count = hi - lo;
+    if (count <= g_leaf_size) {
+        Node& n = g_nodes[self];
+        n.start = int(g_block_count);
+        n.len   = count;
+        g_block_count += uint32_t((count + Block - 1) / Block);
+        for (int i = lo; i < hi; ++i) g_leaf_order.push_back(ids[i]);
+        return self;
     }
-    return assign;
+
+    // Split on the dimension with the widest spread, at the median.
+    int   split_dim = 0;
+    int   best_span = -1;
+    for (int d = 0; d < Dims; ++d) {
+        const int16_t* mn = g_nodes[self].min;
+        const int16_t* mx = g_nodes[self].max;
+        int span = int(mx[d]) - int(mn[d]);
+        if (span > best_span) { best_span = span; split_dim = d; }
+    }
+    int mid = lo + count / 2;
+    std::nth_element(ids.begin() + lo, ids.begin() + mid, ids.begin() + hi,
+                     [split_dim](uint32_t a, uint32_t b) {
+                         return vec(a)[split_dim] < vec(b)[split_dim];
+                     });
+
+    int l = build(ids, lo, mid);
+    int r = build(ids, mid, hi);
+    g_nodes[self].left  = l;
+    g_nodes[self].right = r;
+    return self;
 }
 
-static void write_index(
-    const std::string& out_path,
-    const std::vector<int16_t>& vectors,
-    const std::vector<uint8_t>& labels,
-    const std::vector<std::array<float, rinha::Dims>>& centroids,
-    const std::vector<uint16_t>& assign,
-    const std::vector<uint32_t>& counts
-) {
-    uint32_t n = static_cast<uint32_t>(labels.size());
-    uint32_t k = static_cast<uint32_t>(centroids.size());
+}  // namespace
 
-    std::vector<uint32_t> starts(k + 1);
-    for (uint32_t c = 0; c < k; ++c) starts[c + 1] = starts[c] + counts[c];
-    std::vector<uint32_t> cursor = starts;
-    std::vector<uint32_t> order(n);
-    for (uint32_t i = 0; i < n; ++i) order[cursor[assign[i]]++] = i;
+// ── Index file writer ─────────────────────────────────────────────────────────
 
-    std::vector<uint32_t> block_offsets(k + 1);
-    for (uint32_t c = 0; c < k; ++c) {
-        block_offsets[c + 1] = block_offsets[c] + (counts[c] + rinha::Block - 1) / rinha::Block;
+static void write_index(const std::string& out_path,
+                         const std::vector<int16_t>& vectors,
+                         const std::vector<uint8_t>& labels) {
+    const uint32_t n = uint32_t(labels.size());
+    g_vectors = vectors.data();
+
+    // Bucket reference ids by partition key.
+    std::vector<std::vector<uint32_t>> buckets(256);
+    for (uint32_t i = 0; i < n; ++i)
+        buckets[rinha::partition_key(vec(i)) & 255u].push_back(i);
+
+    g_nodes.clear();
+    g_leaf_order.clear();
+    g_leaf_order.reserve(n);
+    g_block_count = 0;
+
+    std::vector<Partition> parts;
+    for (uint32_t key = 0; key < 256; ++key) {
+        auto& ids = buckets[key];
+        if (ids.empty()) continue;
+        int root = build(ids, 0, int(ids.size()));
+        Partition pt{};
+        pt.key    = key;
+        pt.root   = root;
+        pt.length = int32_t(ids.size());
+        std::memcpy(pt.min, g_nodes[root].min, sizeof(pt.min));
+        std::memcpy(pt.max, g_nodes[root].max, sizeof(pt.max));
+        parts.push_back(pt);
     }
-    uint32_t total_blocks = block_offsets[k];
 
-    std::vector<int16_t> qcentroids(size_t(k) * rinha::Dims);
-    for (uint32_t c = 0; c < k; ++c) {
-        for (int d = 0; d < rinha::Dims; ++d) {
-            qcentroids[size_t(c) * rinha::Dims + d] = static_cast<int16_t>(__builtin_llround(centroids[c][d]));
-        }
-    }
+    const uint32_t part_count  = uint32_t(parts.size());
+    const uint32_t node_count  = uint32_t(g_nodes.size());
+    const uint32_t block_count = g_block_count;
 
-    std::vector<int16_t> bmin(size_t(k) * rinha::Dims, std::numeric_limits<int16_t>::max());
-    std::vector<int16_t> bmax(size_t(k) * rinha::Dims, std::numeric_limits<int16_t>::min());
-    std::vector<uint8_t> out_labels(size_t(total_blocks) * rinha::Block);
-    std::vector<int16_t> blocks(size_t(total_blocks) * rinha::Dims * rinha::Block);
+    // Emit vectors (block-major, dimension-major within a block) and labels in
+    // leaf-scan order, so each leaf's blocks are contiguous.
+    std::vector<int16_t> blocks(size_t(block_count) * Dims * Block, 0);
+    std::vector<uint8_t> out_labels(size_t(block_count) * Block, 0);
 
-    for (uint32_t c = 0; c < k; ++c) {
-        if (counts[c] == 0) {
-            for (int d = 0; d < rinha::Dims; ++d) {
-                bmin[size_t(c) * rinha::Dims + d] = 0;
-                bmax[size_t(c) * rinha::Dims + d] = 0;
-            }
-            continue;
-        }
-        for (uint32_t pos = 0; pos < counts[c]; ++pos) {
-            uint32_t orig = order[starts[c] + pos];
-            uint32_t block = block_offsets[c] + pos / rinha::Block;
-            uint32_t lane = pos % rinha::Block;
-            out_labels[size_t(block) * rinha::Block + lane] = labels[orig];
-            const int16_t* src = vectors.data() + size_t(orig) * rinha::Dims;
-            int16_t* dst = blocks.data() + size_t(block) * rinha::Dims * rinha::Block;
-            for (int d = 0; d < rinha::Dims; ++d) {
-                int16_t v = src[d];
-                dst[d * rinha::Block + lane] = v;
-                auto idx = size_t(c) * rinha::Dims + d;
-                bmin[idx] = std::min(bmin[idx], v);
-                bmax[idx] = std::max(bmax[idx], v);
+    // Leaf block ranges were assigned sequentially during build(); replay the
+    // node list in the same order, consuming ids from g_leaf_order per leaf.
+    {
+        size_t cursor = 0;
+        for (const Node& nd : g_nodes) {
+            if (nd.left >= 0) continue;            // internal
+            for (int j = 0; j < nd.len; ++j) {
+                uint32_t id   = g_leaf_order[cursor++];
+                size_t   blk  = size_t(nd.start) + size_t(j) / Block;
+                int      lane = j % Block;
+                const int16_t* src = vec(id);
+                int16_t* dst = blocks.data() + blk * Dims * Block;
+                for (int d = 0; d < Dims; ++d) dst[d * Block + lane] = src[d];
+                out_labels[blk * Block + lane] = labels[id];
             }
         }
+        if (cursor != g_leaf_order.size())
+            throw std::runtime_error("leaf order mismatch");
     }
 
     rinha::FileHeader h{};
-    h.magic = rinha::kMagic;
-    h.version = rinha::kVer;
-    h.n = n;
-    h.k = k;
-    h.total_blocks = total_blocks;
-    h.block_size = rinha::Block;
-    h.dims = rinha::Dims;
+    h.magic       = rinha::kMagic;
+    h.version     = rinha::kVer;
+    h.n           = n;
+    h.part_count  = part_count;
+    h.node_count  = node_count;
+    h.block_count = block_count;
+    h.dims        = Dims;
+    h.block_size  = Block;
 
-    rinha::SectionOffsets layout = rinha::compute_sections(k, total_blocks);
-    std::vector<char> zero(64);
     std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("cannot write " + out_path);
-
-    auto write_at = [&](size_t off, const void* data, size_t len) {
-        out.seekp(static_cast<std::streamoff>(off));
-        out.write(static_cast<const char*>(data), static_cast<std::streamsize>(len));
+    auto put = [&](const void* d, size_t len) {
+        out.write(static_cast<const char*>(d), std::streamsize(len));
         if (!out) throw std::runtime_error("write failed");
     };
+    put(&h, sizeof(h));
+    put(parts.data(),      parts.size()      * sizeof(Partition));
+    put(g_nodes.data(),    g_nodes.size()    * sizeof(Node));
+    put(blocks.data(),     blocks.size()     * sizeof(int16_t));
+    put(out_labels.data(), out_labels.size());
 
-    write_at(0, &h, sizeof(h));
-    write_at(layout.centroids, qcentroids.data(), qcentroids.size() * sizeof(int16_t));
-    write_at(layout.bbox_min, bmin.data(), bmin.size() * sizeof(int16_t));
-    write_at(layout.bbox_max, bmax.data(), bmax.size() * sizeof(int16_t));
-    write_at(layout.offsets, block_offsets.data(), block_offsets.size() * sizeof(uint32_t));
-    write_at(layout.counts, counts.data(), counts.size() * sizeof(uint32_t));
-    write_at(layout.labels, out_labels.data(), out_labels.size());
-    write_at(layout.blocks, blocks.data(), blocks.size() * sizeof(int16_t));
-    out.seekp(static_cast<std::streamoff>(layout.total - 1));
-    out.put('\0');
-    std::cerr << "index written: " << out_path << " (" << (layout.total / (1024 * 1024)) << " MB)\n";
+    size_t total = sizeof(h)
+                 + parts.size() * sizeof(Partition)
+                 + g_nodes.size() * sizeof(Node)
+                 + blocks.size() * sizeof(int16_t)
+                 + out_labels.size();
+    std::cerr << "index written: " << out_path << " ("
+              << (total / (1024 * 1024)) << " MB)  partitions=" << part_count
+              << " nodes=" << node_count << " blocks=" << block_count << "\n";
 }
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: build-index references.json.gz index.bin [k=4096] [sample=50000] [iters=10]\n";
+        std::cerr << "usage: build-index references.json.gz index.bin [leaf_size=128]\n";
         return 2;
     }
     std::string refs = argv[1];
-    std::string out = argv[2];
-    uint32_t k = argc > 3 ? static_cast<uint32_t>(std::stoul(argv[3])) : 4096;
-    uint32_t sample_size = argc > 4 ? static_cast<uint32_t>(std::stoul(argv[4])) : 50000;
-    int iters = argc > 5 ? std::stoi(argv[5]) : 10;
+    std::string out  = argv[2];
+    g_leaf_size = argc > 3 ? std::atoi(argv[3]) : 128;
+    if (g_leaf_size < Block) g_leaf_size = Block;
 
     auto t0 = Clock::now();
     std::vector<int16_t> vectors;
     std::vector<uint8_t> labels;
     parse_refs(refs, vectors, labels);
-    uint32_t n = static_cast<uint32_t>(labels.size());
-    std::cerr << "parsed " << n << " refs in "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count()
+    std::cerr << "parsed " << labels.size() << " refs in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     Clock::now() - t0).count()
               << "ms\n";
 
-    auto sample = make_sample(n, sample_size, 42);
-    auto centroids = init_kmeans_pp(vectors, sample, k, 42);
-    train_sample_kmeans(vectors, sample, centroids, iters);
-
-    std::vector<uint32_t> counts;
-    auto t_assign = Clock::now();
-    auto assign = assign_all(vectors, centroids, counts);
-    std::cerr << "assigned all refs in "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t_assign).count()
-              << "ms\n";
-
-    auto [min_it, max_it] = std::minmax_element(counts.begin(), counts.end());
-    uint64_t sum = std::accumulate(counts.begin(), counts.end(), uint64_t(0));
-    std::cerr << "cluster sizes min=" << *min_it << " max=" << *max_it
-              << " mean=" << (sum / counts.size()) << "\n";
-
-    write_index(out, vectors, labels, centroids, assign, counts);
+    write_index(out, vectors, labels);
     std::cerr << "done in "
-              << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - t0).count()
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                     Clock::now() - t0).count()
               << "s\n";
     return 0;
 }

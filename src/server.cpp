@@ -52,30 +52,15 @@ static constexpr char k_ready[] =
 static constexpr uint32_t k_ready_len = sizeof(k_ready) - 1;
 
 // ── Shared, read-only after startup ───────────────────────────────────────────
-static rinha::IvfIndex* g_index = nullptr;
+static rinha::BvhIndex* g_index = nullptr;
 static pthread_attr_t   g_worker_attr;
 
-static struct {
-    int      nprobe = 20, repair_min = 99, repair_max = 0;
-    int      fast_nprobe = 1, adapt_min = 2, adapt_max = 4;
-    uint64_t thr0 = 0, thr1 = 0, thr5 = 0, thr_any = 0;
-} g_cfg;
-
-// ── IVF search ────────────────────────────────────────────────────────────────
+// ── Exact BVH search ──────────────────────────────────────────────────────────
+// Single-pass branch-and-bound k-NN — exact, no re-run, constant-ish cost. The
+// IVF re-run (a 20-cluster, ~47k-vector rescan) was the p99 spike; this has no
+// such tail.
 static uint8_t do_search(const int16_t q[rinha::Dims]) noexcept {
-    const auto& c = g_cfg;
-    if (c.fast_nprobe > 0 && c.fast_nprobe < c.nprobe) {
-        rinha::QueryTrace st;
-        uint8_t r = g_index->query(q, c.fast_nprobe, 99, 0, &st);
-        if (r < uint8_t(c.adapt_min) || r > uint8_t(c.adapt_max)) {
-            uint64_t thr = (r==0) ? c.thr0 : (r==1) ? c.thr1 : (r==5) ? c.thr5 : 0;
-            bool rerun = (c.thr_any > 0 && st.final_worst >= c.thr_any)
-                      || (thr       > 0 && st.final_worst >= thr);
-            if (rerun) return g_index->query(q, c.nprobe, c.repair_min, c.repair_max);
-            return r;
-        }
-    }
-    return g_index->query(q, c.nprobe, c.repair_min, c.repair_max);
+    return g_index->query(q);
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -246,7 +231,6 @@ static int unix_listen(const char* path) {
 // ── main ──────────────────────────────────────────────────────────────────────
 int main() {
     auto gi = [](const char* k, int d)      { const char* v = ::getenv(k); return v ? ::atoi(v) : d; };
-    auto gu = [](const char* k, uint64_t d) { const char* v = ::getenv(k); return v ? ::strtoull(v,nullptr,10) : d; };
     auto gs = [](const char* k, const char* d) -> const char* { const char* v = ::getenv(k); return v ? v : d; };
 
     const char* idx_path    = gs("INDEX_PATH", "/index/index.bin");
@@ -270,18 +254,7 @@ int main() {
         }
     }
 
-    g_cfg.nprobe      = gi("NPROBE",                  20);
-    g_cfg.repair_min  = gi("REPAIR_MIN",              99);
-    g_cfg.repair_max  = gi("REPAIR_MAX",               0);
-    g_cfg.fast_nprobe = gi("FAST_NPROBE",              1);
-    g_cfg.adapt_min   = gi("ADAPTIVE_MIN",             2);
-    g_cfg.adapt_max   = gi("ADAPTIVE_MAX",             4);
-    g_cfg.thr0        = gu("EXTREME0_WORST_THRESHOLD", 3501932);
-    g_cfg.thr1        = gu("EXTREME1_WORST_THRESHOLD", 3569273);
-    g_cfg.thr5        = gu("EXTREME5_WORST_THRESHOLD", 4594089);
-    g_cfg.thr_any     = gu("EXTREME_WORST_THRESHOLD",  0);
-
-    static rinha::IvfIndex index(idx_path);
+    static rinha::BvhIndex index(idx_path);
     g_index = &index;
 
     // Keep every page resident so the hot path never eats a minor-fault
