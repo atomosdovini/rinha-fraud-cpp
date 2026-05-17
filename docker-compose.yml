@@ -2,9 +2,14 @@ services:
   # Load balancer obrigatório (ARQUITETURA.md): recebe na :9999 e distribui
   # as conexões round-robin para api1/api2 passando o fd via SCM_RIGHTS sobre
   # Unix sockets — sem inspecionar payload, sem lógica de negócio.
+  #
+  # cpuset: fixa cada serviço em CPUs lógicas dedicadas (Mac Mini = 4 lógicas).
+  # api1→CPU0, api2→CPU1, lb→CPU2,3. Sem migração, cache quente, as APIs não
+  # disputam núcleo entre si. Esquema do fksegundo (1º lugar). Não é capability.
   lb:
     image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
     entrypoint: ["/lb"]
+    cpuset: "2,3"
     ports:
       - "9999:9999"
     environment:
@@ -30,13 +35,13 @@ services:
 
   api1:
     image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
+    cpuset: "0"
     environment:
       - LISTEN=/sockets/api1.sock
       - INDEX_PATH=/index/index.bin
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - PM_QOS=10
-      - WORKER_RT=10
       - WORKERS=1
     volumes:
       - sockets:/sockets
@@ -49,9 +54,6 @@ services:
       nofile:
         soft: 65535
         hard: 65535
-      # rtprio: permite SCHED_FIFO sem capability (RLIMIT_RTPRIO).
-      rtprio: 99
-      memlock: -1
     deploy:
       resources:
         limits:
@@ -60,13 +62,13 @@ services:
 
   api2:
     image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
+    cpuset: "1"
     environment:
       - LISTEN=/sockets/api2.sock
       - INDEX_PATH=/index/index.bin
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - PM_QOS=10
-      - WORKER_RT=10
       - WORKERS=1
     volumes:
       - sockets:/sockets
