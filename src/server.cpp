@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <pthread.h>
+#include <sched.h>
 
 // ── Sizing ────────────────────────────────────────────────────────────────────
 static constexpr size_t RxCap        = 8192;          // per-connection rx buffer
@@ -54,6 +55,19 @@ static constexpr uint32_t k_ready_len = sizeof(k_ready) - 1;
 // ── Shared, read-only after startup ───────────────────────────────────────────
 static rinha::IvfIndex* g_index = nullptr;
 static pthread_attr_t   g_worker_attr;
+static int  g_rt_prio    = 0;       // SCHED_FIFO priority; 0 = RT disabled
+static bool g_rt_granted = false;   // SCHED_FIFO actually available
+
+// Toggle the calling thread between SCHED_FIFO (on) and SCHED_OTHER (off).
+// A worker holds FIFO only while blocked in recv(): woken by an inbound packet
+// it preempts the SCHED_OTHER load generator immediately instead of waiting in
+// the runqueue — that wait is the dominant p99 term. Compute+send then runs as
+// SCHED_OTHER so a busy worker does not outrank the client or ksoftirqd.
+static inline void worker_set_rt(bool on) noexcept {
+    sched_param sp{};
+    sp.sched_priority = on ? g_rt_prio : 0;
+    ::sched_setscheduler(0, on ? SCHED_FIFO : SCHED_OTHER, &sp);
+}
 
 static struct {
     int      nprobe = 20, repair_min = 99, repair_max = 0;
@@ -120,6 +134,7 @@ static void* serve_client(void* arg) {
     for (;;) {
         ssize_t n = ::recv(fd, buf + have, RxCap - size_t(have), 0);
         if (n <= 0) { if (n < 0 && errno == EINTR) continue; break; }
+        if (g_rt_granted) worker_set_rt(false);   // woken — compute as SCHED_OTHER
         have += int(n);
 
         int consumed = 0;
@@ -158,6 +173,7 @@ static void* serve_client(void* arg) {
             if (have > 0) ::memmove(buf, buf + consumed, size_t(have));
         }
         if (have == int(RxCap)) break;                // request larger than buffer
+        if (g_rt_granted) worker_set_rt(true);        // re-arm FIFO for next recv()
     }
 
     ::close(fd);
@@ -291,6 +307,25 @@ int main() {
     pthread_attr_init(&g_worker_attr);
     pthread_attr_setdetachstate(&g_worker_attr, PTHREAD_CREATE_DETACHED);
     pthread_attr_setstacksize(&g_worker_attr, WorkerStack);
+
+    // SCHED_FIFO worker threads: a worker woken by an inbound packet preempts
+    // the SCHED_OTHER load generator at once instead of waiting for a CPU
+    // slice — that wait is the dominant p99 term. Needs RLIMIT_RTPRIO headroom
+    // (`ulimits: rtprio` in compose), NOT a capability. Probe by putting main
+    // on SCHED_FIFO; if refused, everything stays SCHED_OTHER (graceful no-op).
+    g_rt_prio = gi("WORKER_RT", 0);
+    if (g_rt_prio > 0) {
+        sched_param sp{};
+        sp.sched_priority = g_rt_prio;
+        if (::sched_setscheduler(0, SCHED_FIFO, &sp) == 0) {
+            g_rt_granted = true;
+            pthread_attr_setinheritsched(&g_worker_attr, PTHREAD_EXPLICIT_SCHED);
+            pthread_attr_setschedpolicy(&g_worker_attr, SCHED_FIFO);
+            pthread_attr_setschedparam(&g_worker_attr, &sp);
+        } else {
+            ::perror("sched_setscheduler(SCHED_FIFO) — RT disabled");
+        }
+    }
 
     int tcp_port = gi("TCP_PORT", 0);
     if (tcp_port > 0) {
