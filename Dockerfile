@@ -13,7 +13,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY src ./src
 RUN mkdir -p /out /index \
-    && g++ -O3 -DNDEBUG -std=c++20 -march=haswell -mtune=haswell -mavx2 -mfma -flto \
+    && g++ -O3 -DNDEBUG -std=c++20 -march=haswell -mtune=haswell -mavx2 -mfma -flto -fopenmp \
        src/build_index.cpp -lz -o /out/build-index \
     && g++ -O3 -DNDEBUG -std=c++20 -march=haswell -mtune=haswell -mavx2 -mfma -flto \
        -fno-exceptions -pthread -static-libstdc++ -static-libgcc \
@@ -22,7 +22,7 @@ RUN mkdir -p /out /index \
        -fno-exceptions -pthread -static-libstdc++ -static-libgcc \
        src/lb.cpp -o /out/lb
 COPY --from=references /work/references.json.gz /tmp/references.json.gz
-RUN /out/build-index /tmp/references.json.gz /index/index.bin 128 \
+RUN /out/build-index /tmp/references.json.gz /index/index.bin 1280 65536 6 \
     && ls -lh /index/index.bin
 
 FROM --platform=linux/amd64 debian:trixie-slim AS runtime
