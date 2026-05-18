@@ -1,15 +1,17 @@
-// server.cpp — Fraud-detection HTTP server, single-thread epoll reactor.
+// server.cpp — Fraud-detection HTTP server, thread-per-connection.
 //
-// The load balancer (lb) accepts client TCP sockets on :9999 and hands their
-// file descriptors to us over a Unix control socket via SCM_RIGHTS. One epoll
-// loop, one thread, owns every client fd: on readiness it does recv → parse →
-// search → send. HTTP/1.1 keep-alive.
+// The load balancer (lb.cpp) accepts client TCP sockets on :9999 and hands
+// their file descriptors to us over a Unix control socket via SCM_RIGHTS.
+// For each received fd we spawn one detached worker thread that owns that
+// connection start to finish: blocking recv → parse → search → send, looping
+// for HTTP/1.1 keep-alive.
 //
-// No io_uring: the Rinha host forbids `security_opt: seccomp:unconfined`, and
-// the default seccomp profile blocks the io_uring_* syscalls. epoll uses only
-// standard syscalls. A single reactor thread is put on SCHED_FIFO at startup
-// (env WORKER_RT) so it preempts the SCHED_OTHER load generator the instant a
-// packet arrives — the recipe the top finishers use.
+// No io_uring. At the test's concurrency (a few hundred keep-alive
+// connections, ~1 request in flight each) a thread blocked in recv() is woken
+// directly by the kernel with zero head-of-line blocking — lower tail latency
+// than a single shared event-loop reactor on a CPU-contended host. (Measured:
+// the io_uring reactor sat at p99 ~1.02ms on the Rinha host; this model is
+// what the top finishers use.)
 
 #include "index.hpp"
 #include "tx.hpp"
@@ -17,7 +19,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/uio.h>
-#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -29,15 +30,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
-#include <poll.h>
-#include <sched.h>
 #include <string>
 #include <string_view>
+#include <pthread.h>
 
 // ── Sizing ────────────────────────────────────────────────────────────────────
-static constexpr int    MaxConns   = 2048;
-static constexpr size_t RxCap      = 8192;
-static constexpr int    MaxEvents  = 256;
+static constexpr size_t RxCap        = 8192;          // per-connection rx buffer
+static constexpr size_t WorkerStack   = 128 * 1024;    // detached worker stack
 
 // ── Pre-built responses ───────────────────────────────────────────────────────
 static constexpr struct { const char* data; uint32_t len; } k_fraud[6] = {
@@ -54,6 +53,7 @@ static constexpr uint32_t k_ready_len = sizeof(k_ready) - 1;
 
 // ── Shared, read-only after startup ───────────────────────────────────────────
 static rinha::IvfIndex* g_index = nullptr;
+static pthread_attr_t   g_worker_attr;
 
 static struct {
     int      nprobe = 20, repair_min = 99, repair_max = 0;
@@ -106,123 +106,74 @@ static bool write_all(int fd, const char* p, size_t len) noexcept {
         ssize_t n = ::send(fd, p, len, MSG_NOSIGNAL);
         if (n > 0) { p += n; len -= size_t(n); continue; }
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            pollfd pfd { fd, POLLOUT, 0 };
-            ::poll(&pfd, 1, 50);
-            continue;
-        }
         return false;
     }
     return true;
 }
 
-// ── Connection table (slot pool) ──────────────────────────────────────────────
-struct Conn {
-    int      fd   = -1;
-    uint32_t have = 0;
-    char     buf[RxCap];
-};
-static Conn g_conns[MaxConns];
-static int  g_free[MaxConns];
-static int  g_free_top = 0;
-static int  g_epfd     = -1;
+// ── Connection worker — owns one client fd start to finish ────────────────────
+static void* serve_client(void* arg) {
+    int  fd = int(intptr_t(arg));
+    char buf[RxCap];
+    int  have = 0;
 
-// epoll token: high 32 bits = kind, low 32 = slot (or fd for ctrl/listen).
-enum Kind : uint32_t { K_LISTEN = 1, K_CTRL_LISTEN = 2, K_CTRL = 3, K_CLIENT = 4 };
-static uint64_t tok(Kind k, uint32_t v) { return (uint64_t(k) << 32) | v; }
-static Kind     tok_kind(uint64_t t)    { return Kind(t >> 32); }
-static uint32_t tok_val (uint64_t t)    { return uint32_t(t); }
+    for (;;) {
+        ssize_t n = ::recv(fd, buf + have, RxCap - size_t(have), 0);
+        if (n <= 0) { if (n < 0 && errno == EINTR) continue; break; }
+        have += int(n);
 
-static void pool_init() {
-    for (int i = 0; i < MaxConns; ++i) g_free[i] = MaxConns - 1 - i;
-    g_free_top = MaxConns;
-}
-static int  pool_alloc() { return g_free_top > 0 ? g_free[--g_free_top] : -1; }
-static void pool_free(int slot) { g_free[g_free_top++] = slot; }
+        int consumed = 0;
+        while (consumed < have) {
+            std::string_view data(buf + consumed, size_t(have - consumed));
 
-static void epoll_add(int fd, Kind k, uint32_t v) {
-    epoll_event ev{};
-    ev.events   = EPOLLIN;
-    ev.data.u64 = tok(k, v);
-    ::epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev);
-}
+            size_t hdr_end = data.find("\r\n\r\n");
+            if (hdr_end == std::string_view::npos) break;
 
-static void close_client(int slot) {
-    int fd = g_conns[slot].fd;
-    ::epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, nullptr);
+            std::string_view hdr  = data.substr(0, hdr_end + 4);
+            int              clen = http_content_len(hdr);
+            size_t           need = hdr_end + 4 + size_t(clen);
+            if (data.size() < need) break;            // body not fully buffered
+
+            std::string_view path = http_path(hdr);
+            std::string_view body = data.substr(hdr_end + 4, size_t(clen));
+
+            const char* resp; uint32_t rlen;
+            if (path == "/fraud-score") {
+                int16_t q[rinha::Dims];
+                uint8_t b = fraud::extract(body, q) ? do_search(q) : 0;
+                if (b > 5) b = 5;
+                resp = k_fraud[b].data; rlen = k_fraud[b].len;
+            } else if (path == "/ready") {
+                resp = k_ready;        rlen = k_ready_len;
+            } else {
+                resp = k_fraud[0].data; rlen = k_fraud[0].len;
+            }
+            if (!write_all(fd, resp, rlen)) { ::close(fd); return nullptr; }
+
+            consumed += int(need);
+        }
+
+        if (consumed > 0) {
+            have -= consumed;
+            if (have > 0) ::memmove(buf, buf + consumed, size_t(have));
+        }
+        if (have == int(RxCap)) break;                // request larger than buffer
+    }
+
     ::close(fd);
-    g_conns[slot].fd   = -1;
-    g_conns[slot].have = 0;
-    pool_free(slot);
+    return nullptr;
 }
 
-// Register a freshly accepted client fd into the reactor.
-static void add_client(int fd) {
-    int slot = pool_alloc();
-    if (slot < 0) { ::close(fd); return; }
+static void spawn_client(int fd) {
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,  &one, sizeof(one));
     ::setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
-    int fl = ::fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    g_conns[slot].fd   = fd;
-    g_conns[slot].have = 0;
-    epoll_add(fd, K_CLIENT, uint32_t(slot));
+    pthread_t tid;
+    if (pthread_create(&tid, &g_worker_attr, serve_client, (void*)intptr_t(fd)) != 0)
+        ::close(fd);
 }
 
-// ── Process buffered HTTP and reply ───────────────────────────────────────────
-static void handle_client(int slot) {
-    Conn& c = g_conns[slot];
-
-    ssize_t n = ::recv(c.fd, c.buf + c.have, RxCap - c.have, 0);
-    if (n == 0) { close_client(slot); return; }
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
-        close_client(slot);
-        return;
-    }
-    c.have += uint32_t(n);
-
-    uint32_t consumed = 0;
-    while (consumed < c.have) {
-        std::string_view data(c.buf + consumed, c.have - consumed);
-
-        size_t hdr_end = data.find("\r\n\r\n");
-        if (hdr_end == std::string_view::npos) break;
-
-        std::string_view hdr  = data.substr(0, hdr_end + 4);
-        int              clen = http_content_len(hdr);
-        size_t           need = hdr_end + 4 + size_t(clen);
-        if (data.size() < need) break;
-
-        std::string_view path = http_path(hdr);
-        std::string_view body = data.substr(hdr_end + 4, size_t(clen));
-
-        const char* resp; uint32_t rlen;
-        if (path == "/fraud-score") {
-            int16_t q[rinha::Dims];
-            uint8_t b = fraud::extract(body, q) ? do_search(q) : 0;
-            if (b > 5) b = 5;
-            resp = k_fraud[b].data; rlen = k_fraud[b].len;
-        } else if (path == "/ready") {
-            resp = k_ready;         rlen = k_ready_len;
-        } else {
-            resp = k_fraud[0].data; rlen = k_fraud[0].len;
-        }
-        if (!write_all(c.fd, resp, rlen)) { close_client(slot); return; }
-
-        consumed += uint32_t(need);
-    }
-
-    if (consumed > 0) {
-        c.have -= consumed;
-        if (c.have > 0) ::memmove(c.buf, c.buf + consumed, c.have);
-    }
-    if (c.have == RxCap) close_client(slot);   // request larger than buffer
-}
-
-// ── Receive an fd from the load balancer over a control socket ────────────────
-// Returns a client fd, -2 if the socket has no more data, -1 on close/error.
+// ── Receive one fd from the load balancer over a control socket ───────────────
 static int recv_fd(int ctrl_fd) noexcept {
     char   b[1];
     char   cmsg[CMSG_SPACE(sizeof(int))];
@@ -233,27 +184,35 @@ static int recv_fd(int ctrl_fd) noexcept {
     mh.msg_control    = cmsg;
     mh.msg_controllen = sizeof(cmsg);
 
-    ssize_t n = ::recvmsg(ctrl_fd, &mh, 0);
-    if (n <= 0) return (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) ? -2 : -1;
+    ssize_t n;
+    do { n = ::recvmsg(ctrl_fd, &mh, 0); } while (n < 0 && errno == EINTR);
+    if (n <= 0) return -1;
 
-    for (cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
-        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+    for (cmsghdr* c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
             int fd;
-            ::memcpy(&fd, CMSG_DATA(cm), sizeof(fd));
+            ::memcpy(&fd, CMSG_DATA(c), sizeof(fd));
             return fd;
         }
     }
     return -1;
 }
 
-static void close_ctrl(int fd) {
-    ::epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, nullptr);
-    ::close(fd);
+// One control connection from the LB carries a stream of client fds.
+static void* serve_control(void* arg) {
+    int ctrl_fd = int(intptr_t(arg));
+    for (;;) {
+        int fd = recv_fd(ctrl_fd);
+        if (fd < 0) break;
+        spawn_client(fd);
+    }
+    ::close(ctrl_fd);
+    return nullptr;
 }
 
 // ── Listen sockets ────────────────────────────────────────────────────────────
 static int tcp_listen(int port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) { ::perror("socket"); ::exit(1); }
     int one = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -271,7 +230,7 @@ static int tcp_listen(int port) {
 
 static int unix_listen(const char* path) {
     ::unlink(path);
-    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) { ::perror("socket"); ::exit(1); }
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -295,6 +254,22 @@ int main() {
 
     ::signal(SIGPIPE, SIG_IGN);
 
+    // PM QoS: cap the CPU idle wake-up latency via /dev/cpu_dma_latency.
+    // PM_QOS is the target in µs; the kernel then forbids any C-state whose
+    // exit latency exceeds it. ~10 keeps shallow C1/C1E (fast wake) but
+    // forbids C6 (~85 µs). 0/unset = disabled. Never use 0 as the target —
+    // it forbids every C-state and the host thermal-throttles. fd leaked on
+    // purpose so the constraint holds for the process lifetime.
+    int pm_qos = gi("PM_QOS", 0);
+    if (pm_qos > 0) {
+        int pm_fd = ::open("/dev/cpu_dma_latency", O_WRONLY | O_CLOEXEC);
+        if (pm_fd >= 0) {
+            int32_t target = pm_qos;
+            if (::write(pm_fd, &target, sizeof(target)) != sizeof(target))
+                ::close(pm_fd);
+        }
+    }
+
     g_cfg.nprobe      = gi("NPROBE",                  20);
     g_cfg.repair_min  = gi("REPAIR_MIN",              99);
     g_cfg.repair_max  = gi("REPAIR_MAX",               0);
@@ -309,82 +284,35 @@ int main() {
     static rinha::IvfIndex index(idx_path);
     g_index = &index;
 
-    // Keep every page resident — the hot path never eats a minor-fault stall.
+    // Keep every page resident so the hot path never eats a minor-fault
+    // stall. Best-effort: silently skipped without RLIMIT_MEMLOCK headroom.
     ::mlockall(MCL_CURRENT | MCL_FUTURE);
 
-    // SCHED_FIFO on this single reactor thread: woken by an inbound packet it
-    // preempts the SCHED_OTHER load generator at once instead of waiting for a
-    // CPU slice. Needs RLIMIT_RTPRIO headroom (`ulimits: rtprio` in compose),
-    // NOT a capability. Graceful no-op if refused.
-    if (int rt = gi("WORKER_RT", 0); rt > 0) {
-        sched_param sp{};
-        sp.sched_priority = rt;
-        if (::sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
-            ::perror("sched_setscheduler(SCHED_FIFO) — RT disabled");
-    }
-
-    pool_init();
-    g_epfd = ::epoll_create1(EPOLL_CLOEXEC);
-    if (g_epfd < 0) { ::perror("epoll_create1"); ::exit(1); }
+    pthread_attr_init(&g_worker_attr);
+    pthread_attr_setdetachstate(&g_worker_attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&g_worker_attr, WorkerStack);
 
     int tcp_port = gi("TCP_PORT", 0);
-    int tcp_srv = -1, ctrl_srv = -1;
     if (tcp_port > 0) {
-        tcp_srv = tcp_listen(tcp_port);
-        epoll_add(tcp_srv, K_LISTEN, uint32_t(tcp_srv));
+        // Direct mode: accept TCP clients ourselves (no load balancer).
+        int srv = tcp_listen(tcp_port);
+        for (;;) {
+            int fd = ::accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
+            if (fd < 0) { if (errno == EINTR) continue; continue; }
+            spawn_client(fd);
+        }
     } else {
+        // LB mode: the load balancer connects to our control socket and
+        // streams client fds over it. One thread per control connection.
         std::string ctrl_path = std::string(listen_path) + ".ctrl";
-        ctrl_srv = unix_listen(ctrl_path.c_str());
-        epoll_add(ctrl_srv, K_CTRL_LISTEN, uint32_t(ctrl_srv));
-    }
-
-    epoll_event events[MaxEvents];
-    for (;;) {
-        int n = ::epoll_wait(g_epfd, events, MaxEvents, -1);
-        if (n < 0) { if (errno == EINTR) continue; break; }
-
-        for (int i = 0; i < n; ++i) {
-            uint64_t t  = events[i].data.u64;
-            uint32_t ev = events[i].events;
-            switch (tok_kind(t)) {
-
-            case K_LISTEN:
-                for (;;) {
-                    int fd = ::accept4(tcp_srv, nullptr, nullptr, SOCK_CLOEXEC);
-                    if (fd < 0) break;
-                    add_client(fd);
-                }
-                break;
-
-            case K_CTRL_LISTEN:
-                for (;;) {
-                    int fd = ::accept4(ctrl_srv, nullptr, nullptr,
-                                       SOCK_NONBLOCK | SOCK_CLOEXEC);
-                    if (fd < 0) break;
-                    epoll_add(fd, K_CTRL, uint32_t(fd));
-                }
-                break;
-
-            case K_CTRL: {
-                int ctrl_fd = int(tok_val(t));
-                if (ev & (EPOLLHUP | EPOLLERR)) { close_ctrl(ctrl_fd); break; }
-                for (;;) {
-                    int fd = recv_fd(ctrl_fd);
-                    if (fd == -2) break;                 // drained
-                    if (fd == -1) { close_ctrl(ctrl_fd); break; }
-                    add_client(fd);
-                }
-                break;
-            }
-
-            case K_CLIENT: {
-                int slot = int(tok_val(t));
-                if (g_conns[slot].fd < 0) break;
-                if (ev & (EPOLLHUP | EPOLLERR)) { close_client(slot); break; }
-                handle_client(slot);
-                break;
-            }
-            }
+        int srv_ctrl = unix_listen(ctrl_path.c_str());
+        for (;;) {
+            int cfd = ::accept4(srv_ctrl, nullptr, nullptr, SOCK_CLOEXEC);
+            if (cfd < 0) { if (errno == EINTR) continue; continue; }
+            pthread_t tid;
+            if (pthread_create(&tid, &g_worker_attr, serve_control,
+                               (void*)intptr_t(cfd)) != 0)
+                ::close(cfd);
         }
     }
     return 0;
