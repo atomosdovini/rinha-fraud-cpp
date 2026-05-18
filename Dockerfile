@@ -17,7 +17,7 @@ RUN mkdir -p /out /index \
        src/build_index.cpp -lz -o /out/build-index \
     && g++ -O3 -DNDEBUG -std=c++20 -march=haswell -mtune=haswell -mavx2 -mfma -flto \
        -fno-exceptions -pthread -static-libstdc++ -static-libgcc \
-       src/server.cpp -o /out/server \
+       src/server.cpp -luring -o /out/server \
     && g++ -O3 -DNDEBUG -std=c++20 -march=haswell -mtune=haswell -flto \
        -fno-exceptions -pthread -static-libstdc++ -static-libgcc \
        src/lb.cpp -o /out/lb
