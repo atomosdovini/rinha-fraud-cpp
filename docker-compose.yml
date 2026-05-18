@@ -7,6 +7,7 @@ services:
   # `security_opt`, `devices`, `privileged`, `cpuset`. Permitido: `ulimits`.
   lb:
     image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
+    restart: always
     entrypoint: ["/lb"]
     ports:
       - "9999:9999"
@@ -31,6 +32,7 @@ services:
 
   api1:
     image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
+    restart: always
     environment:
       - LISTEN=/sockets/api1.sock
       - INDEX_PATH=/index/index.bin
@@ -55,6 +57,7 @@ services:
 
   api2:
     image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
+    restart: always
     environment:
       - LISTEN=/sockets/api2.sock
       - INDEX_PATH=/index/index.bin
