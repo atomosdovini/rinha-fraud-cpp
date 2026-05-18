@@ -40,6 +40,7 @@ services:
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - PM_QOS=10
+      - WORKER_RT=10
       - WORKERS=1
     volumes:
       - sockets:/sockets
@@ -52,6 +53,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      # rtprio: permite SCHED_FIFO sem capability (RLIMIT_RTPRIO).
+      rtprio: 99
+      memlock: -1
     deploy:
       resources:
         limits:
@@ -66,6 +70,7 @@ services:
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - PM_QOS=10
+      - WORKER_RT=10
       - WORKERS=1
     volumes:
       - sockets:/sockets
@@ -80,6 +85,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      # rtprio: permite SCHED_FIFO sem capability (RLIMIT_RTPRIO).
+      rtprio: 99
+      memlock: -1
     deploy:
       resources:
         limits:
