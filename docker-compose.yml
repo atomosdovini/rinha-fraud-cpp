@@ -3,9 +3,8 @@ services:
   # as conexões round-robin para api1/api2 passando o fd via SCM_RIGHTS sobre
   # Unix sockets — sem inspecionar payload, sem lógica de negócio.
   #
-  # NOTA: cpuset (pinning de CPU) foi testado e PIOROU muito (1.00 -> 1.43ms,
-  # 25º lugar) — provável que CPU0/CPU1 sejam HT siblings do mesmo core físico.
-  # Não usar cpuset.
+  # Restrições da Engine (rejeitam a submissão): proibido `cap_add`,
+  # `security_opt`, `devices`, `privileged`, `cpuset`. Permitido: `ulimits`.
   lb:
     image: ghcr.io/atomosdovini/rinha-fraud-cpp:latest
     entrypoint: ["/lb"]
@@ -20,8 +19,6 @@ services:
     depends_on:
       - api1
       - api2
-    security_opt:
-      - seccomp:unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -39,16 +36,10 @@ services:
       - INDEX_PATH=/index/index.bin
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
-      - PM_QOS=10
       - WORKER_RT=10
       - WORKERS=1
     volumes:
       - sockets:/sockets
-    security_opt:
-      - seccomp:unconfined
-    devices:
-      # PM QoS: server escreve PM_QOS µs aqui p/ limitar C-states (C1/C1E, sem C6).
-      - /dev/cpu_dma_latency
     ulimits:
       nofile:
         soft: 65535
@@ -69,16 +60,10 @@ services:
       - INDEX_PATH=/index/index.bin
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
-      - PM_QOS=10
       - WORKER_RT=10
       - WORKERS=1
     volumes:
       - sockets:/sockets
-    security_opt:
-      - seccomp:unconfined
-    devices:
-      # PM QoS: server escreve PM_QOS µs aqui p/ limitar C-states (C1/C1E, sem C6).
-      - /dev/cpu_dma_latency
     logging:
       driver: "none"
     ulimits:
