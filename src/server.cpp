@@ -284,9 +284,10 @@ int main() {
     static rinha::IvfIndex index(idx_path);
     g_index = &index;
 
-    // Keep every page resident so the hot path never eats a minor-fault
-    // stall. Best-effort: silently skipped without RLIMIT_MEMLOCK headroom.
-    ::mlockall(MCL_CURRENT | MCL_FUTURE);
+    // NB: no mlockall — MCL_FUTURE locks every future allocation, and with one
+    // thread stack per connection that blows the container memory limit on the
+    // Rinha host (a worker faults and dies mid-response → malformed reply).
+    // It gave no measured cloud benefit anyway.
 
     pthread_attr_init(&g_worker_attr);
     pthread_attr_setdetachstate(&g_worker_attr, PTHREAD_CREATE_DETACHED);
