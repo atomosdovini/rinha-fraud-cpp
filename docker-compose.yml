@@ -39,10 +39,6 @@ services:
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - WORKERS=1
-      # Limita probes do re-run IVF. cap=1 = nao probar nenhum cluster alem
-      # do fast probe. Local k6: 0 FP/FN preservado (dataset igual ao da nuvem
-      # -> recall deterministico). Hipotese: corta o termo dominante do p99.
-      - RERUN_CAP=1
     volumes:
       - sockets:/sockets
     ulimits:
@@ -65,7 +61,6 @@ services:
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - WORKERS=1
-      - RERUN_CAP=1
     volumes:
       - sockets:/sockets
     logging:
