@@ -39,6 +39,13 @@ services:
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - WORKERS=1
+      # Re-run gating: thresholds ~12% acima dos defaults compilados
+      # (3501932/3569273/4594089). Hipotese: re-run do IVF e o termo dominante
+      # do p99 (CLAUDE.md); subir threshold = re-run dispara menos.
+      # OBRIGATORIO validar 0 FP/FN com k6 local antes de gastar previa.
+      - EXTREME0_WORST_THRESHOLD=3922164
+      - EXTREME1_WORST_THRESHOLD=3997585
+      - EXTREME5_WORST_THRESHOLD=5145380
     volumes:
       - sockets:/sockets
     ulimits:
@@ -61,6 +68,9 @@ services:
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - WORKERS=1
+      - EXTREME0_WORST_THRESHOLD=3922164
+      - EXTREME1_WORST_THRESHOLD=3997585
+      - EXTREME5_WORST_THRESHOLD=5145380
     volumes:
       - sockets:/sockets
     logging:
