@@ -39,7 +39,6 @@ services:
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - WORKERS=1
-      - RERUN_CAP=6
     volumes:
       - sockets:/sockets
     ulimits:
@@ -62,7 +61,6 @@ services:
       - INDEX_MMAP=1
       - MALLOC_ARENA_MAX=1
       - WORKERS=1
-      - RERUN_CAP=6
     volumes:
       - sockets:/sockets
     logging:
